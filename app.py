@@ -2,10 +2,13 @@ import asyncio
 import base64
 import logging
 import os
-from typing import Dict, List, Optional
+import time
+from typing import Dict, Optional, Tuple
 
+import httpx
 import yt_dlp
-from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from ytmusicapi import YTMusic
 
 logging.basicConfig(level=logging.INFO)
@@ -16,14 +19,15 @@ ytmusic = YTMusic()
 
 COOKIES_PATH = "/tmp/cookies.txt"
 
-# Estado en memoria por usuario/dispositivo
-# Estructura: { user_id: { "queue": [track, ...], "index": 0, "offset": 0 } }
+# Estado por usuario: { user_id: { "queue": [track, ...], "index": 0, "offset": 0 } }
 PLAYER_STATE: Dict[str, dict] = {}
+
+# Caché de streams: { video_id: (url, headers, expires_at) }
+STREAM_CACHE: Dict[str, Tuple[str, dict, float]] = {}
 
 
 @app.on_event("startup")
 def load_cookies_from_env():
-    """Decodifica YOUTUBE_COOKIES_B64 desde las variables de entorno de Azure."""
     cookies_b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
     if cookies_b64:
         try:
@@ -34,11 +38,15 @@ def load_cookies_from_env():
         except Exception as e:
             logger.error("Error decodificando YOUTUBE_COOKIES_B64: %s", e)
     else:
-        logger.warning("YOUTUBE_COOKIES_B64 no está configurada. YouTube podría bloquear la IP.")
+        logger.warning("YOUTUBE_COOKIES_B64 no está configurada.")
 
 
-def extract_audio_url(video_id: str) -> Optional[str]:
-    """Extrae la URL directa del stream de audio (M4A/AAC) compatible con Alexa."""
+def extract_audio_info(video_id: str) -> Optional[Tuple[str, dict]]:
+    """Extrae y cachea la URL directa M4A y sus headers desde YouTube."""
+    cached = STREAM_CACHE.get(video_id)
+    if cached and cached[2] > time.time():
+        return cached[0], cached[1]
+
     url = f"https://www.youtube.com/watch?v={video_id}"
     ydl_opts = {
         "format": "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio",
@@ -53,14 +61,26 @@ def extract_audio_url(video_id: str) -> Optional[str]:
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            return info.get("url")
+            stream_url = info.get("url")
+            headers = info.get("http_headers", {})
+            if stream_url:
+                STREAM_CACHE[video_id] = (stream_url, headers, time.time() + 1800)
+                return stream_url, headers
+            return None
     except Exception as e:
         logger.error("Error extrayendo audio para %s: %s", video_id, e)
         return None
 
 
+def get_public_base_url(request: Request) -> str:
+    """Fuerza HTTPS porque Azure Container Apps termina TLS en el ingress."""
+    base = str(request.base_url).rstrip("/")
+    if base.startswith("http://"):
+        base = "https://" + base[len("http://"):]
+    return base
+
+
 def search_song(query: str) -> Optional[dict]:
-    """Busca una canción en YouTube Music y devuelve sus metadatos básicos."""
     results = ytmusic.search(query, filter="songs", limit=5)
     if not results:
         results = ytmusic.search(query, filter="videos", limit=5)
@@ -81,7 +101,6 @@ def search_song(query: str) -> Optional[dict]:
 
 
 def populate_related_queue(user_id: str, seed_video_id: str):
-    """Carga canciones relacionadas en segundo plano para reproducción continua."""
     try:
         watch = ytmusic.get_watch_playlist(videoId=seed_video_id, limit=15)
         tracks = watch.get("tracks", [])
@@ -177,6 +196,45 @@ def health():
     return {"status": "ok", "cookies_loaded": os.path.exists(COOKIES_PATH)}
 
 
+@app.get("/stream/{video_id}")
+async def stream_audio(video_id: str, request: Request):
+    """Proxy de audio M4A para que el Echo descargue desde la IP de Azure."""
+    info = await asyncio.to_thread(extract_audio_info, video_id)
+    if not info:
+        raise HTTPException(status_code=502, detail="No se pudo extraer el audio")
+
+    target_url, yt_headers = info
+    req_headers = dict(yt_headers)
+    if "range" in request.headers:
+        req_headers["Range"] = request.headers["range"]
+
+    client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+    req = client.build_request("GET", target_url, headers=req_headers)
+    resp = await client.send(req, stream=True)
+
+    response_headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": resp.headers.get("content-type", "audio/mp4"),
+    }
+    for h in ("content-length", "content-range"):
+        if h in resp.headers:
+            response_headers[h.title()] = resp.headers[h]
+
+    async def iter_chunks():
+        try:
+            async for chunk in resp.aiter_bytes(chunk_size=65536):
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        iter_chunks(),
+        status_code=resp.status_code,
+        headers=response_headers,
+    )
+
+
 @app.post("/alexa")
 async def alexa_webhook(request: Request, background_tasks: BackgroundTasks):
     payload = await request.json()
@@ -188,17 +246,16 @@ async def alexa_webhook(request: Request, background_tasks: BackgroundTasks):
         .get("user", {})
         .get("userId", "default_user")
     )
+    base_url = get_public_base_url(request)
 
     logger.info("Evento recibido: %s", req_type)
 
-    # 1. Apertura de la Skill
     if req_type == "LaunchRequest":
         return build_speech_response(
             "YouTube Music listo. ¿Qué canción o artista quieres escuchar?",
             end_session=False,
         )
 
-    # 2. Intents de voz
     if req_type == "IntentRequest":
         intent = req.get("intent", {})
         intent_name = intent.get("name", "")
@@ -213,19 +270,14 @@ async def alexa_webhook(request: Request, background_tasks: BackgroundTasks):
             if not track:
                 return build_speech_response(f"No encontré resultados para {query}.", end_session=True)
 
-            stream_url = await asyncio.to_thread(extract_audio_url, track["videoId"])
-            if not stream_url:
-                return build_speech_response(
-                    "Encontré la canción, pero YouTube bloqueó el audio. Revisa las cookies.",
-                    end_session=True,
-                )
-
             PLAYER_STATE[user_id] = {"queue": [track], "index": 0, "offset": 0}
+            background_tasks.add_task(extract_audio_info, track["videoId"])
             background_tasks.add_task(populate_related_queue, user_id, track["videoId"])
 
+            proxy_url = f"{base_url}/stream/{track['videoId']}"
             return build_play_response(
                 track=track,
-                stream_url=stream_url,
+                stream_url=proxy_url,
                 speech=f"Reproduciendo {track['title']} de {track['artist']}",
             )
 
@@ -238,13 +290,10 @@ async def alexa_webhook(request: Request, background_tasks: BackgroundTasks):
                 return build_speech_response("No hay ninguna canción pausada.", end_session=True)
 
             track = state["queue"][state["index"]]
-            stream_url = await asyncio.to_thread(extract_audio_url, track["videoId"])
-            if not stream_url:
-                return build_speech_response("No pude reanudar el audio.", end_session=True)
-
+            proxy_url = f"{base_url}/stream/{track['videoId']}"
             return build_play_response(
                 track=track,
-                stream_url=stream_url,
+                stream_url=proxy_url,
                 offset_ms=state.get("offset", 0),
             )
 
@@ -256,13 +305,10 @@ async def alexa_webhook(request: Request, background_tasks: BackgroundTasks):
             state["index"] += 1
             state["offset"] = 0
             track = state["queue"][state["index"]]
-            stream_url = await asyncio.to_thread(extract_audio_url, track["videoId"])
-            if not stream_url:
-                return build_speech_response("No pude cargar la siguiente canción.", end_session=True)
-
+            proxy_url = f"{base_url}/stream/{track['videoId']}"
             return build_play_response(
                 track=track,
-                stream_url=stream_url,
+                stream_url=proxy_url,
                 speech=f"Siguiente: {track['title']}",
             )
 
@@ -274,11 +320,8 @@ async def alexa_webhook(request: Request, background_tasks: BackgroundTasks):
             state["index"] -= 1
             state["offset"] = 0
             track = state["queue"][state["index"]]
-            stream_url = await asyncio.to_thread(extract_audio_url, track["videoId"])
-            if not stream_url:
-                return build_speech_response("No pude cargar la canción anterior.", end_session=True)
-
-            return build_play_response(track=track, stream_url=stream_url)
+            proxy_url = f"{base_url}/stream/{track['videoId']}"
+            return build_play_response(track=track, stream_url=proxy_url)
 
         if intent_name == "AMAZON.HelpIntent":
             return build_speech_response(
@@ -286,20 +329,18 @@ async def alexa_webhook(request: Request, background_tasks: BackgroundTasks):
                 end_session=False,
             )
 
-    # 3. Eventos del AudioPlayer (reproducción continua y estado)
     if req_type == "AudioPlayer.PlaybackNearlyFinished":
         state = PLAYER_STATE.get(user_id)
         current_token = req.get("token")
         if state and state["index"] + 1 < len(state["queue"]):
             next_track = state["queue"][state["index"] + 1]
-            stream_url = await asyncio.to_thread(extract_audio_url, next_track["videoId"])
-            if stream_url:
-                return build_play_response(
-                    track=next_track,
-                    stream_url=stream_url,
-                    play_behavior="ENQUEUE",
-                    expected_previous_token=current_token,
-                )
+            proxy_url = f"{base_url}/stream/{next_track['videoId']}"
+            return build_play_response(
+                track=next_track,
+                stream_url=proxy_url,
+                play_behavior="ENQUEUE",
+                expected_previous_token=current_token,
+            )
 
     elif req_type == "AudioPlayer.PlaybackStarted":
         state = PLAYER_STATE.get(user_id)
