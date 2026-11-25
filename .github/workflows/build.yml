@@ -24,4 +24,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: alexaytmusicbr2026.azurecr.io/alexa-ytmusic:v2
+          tags: alexaytmusicbr2026.azurecr.io/alexa-ytmusic:v3
