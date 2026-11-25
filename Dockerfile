@@ -2,8 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Certificados SSL para peticiones HTTPS a YouTube
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+# Certificados SSL y Deno (runtime JS requerido por yt-dlp con cookies)
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl unzip \
+    && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
