@@ -5,3 +5,8 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 ytmusicapi==1.9.1
 yt-dlp[default]
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx
+ytmusicapi
+yt-dlp[default]
