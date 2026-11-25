@@ -1,7 +1,9 @@
 import asyncio
 import base64
+import json
 import logging
 import os
+import random
 import time
 from typing import Dict, Optional, Tuple
 
@@ -15,9 +17,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("alexa-ytmusic")
 
 app = FastAPI(title="Alexa YouTube Music Backend")
-ytmusic = YTMusic()
 
 COOKIES_PATH = "/tmp/cookies.txt"
+BROWSER_AUTH_PATH = "/tmp/browser.json"
+
+ytmusic = YTMusic()
+YTMUSIC_AUTHENTICATED = False
 
 # Estado por usuario: { user_id: { "queue": [track, ...], "index": 0, "offset": 0 } }
 PLAYER_STATE: Dict[str, dict] = {}
@@ -26,8 +31,48 @@ PLAYER_STATE: Dict[str, dict] = {}
 STREAM_CACHE: Dict[str, Tuple[str, dict, float]] = {}
 
 
+def build_ytmusic_browser_auth(cookies_path: str, output_path: str) -> bool:
+    """Convierte cookies.txt (Netscape) en browser.json para autenticar ytmusicapi."""
+    cookies = []
+    has_sapisid = False
+    try:
+        with open(cookies_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    domain, name, value = parts[0], parts[5], parts[6]
+                    if "youtube.com" in domain:
+                        cookies.append(f"{name}={value}")
+                        if name in ("SAPISID", "__Secure-3PAPISID"):
+                            has_sapisid = True
+
+        if not cookies or not has_sapisid:
+            logger.warning("cookies.txt no contiene SAPISID; las playlists privadas no estarán disponibles.")
+            return False
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+            "Accept": "*/*",
+            "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
+            "Content-Type": "application/json",
+            "X-Goog-AuthUser": "0",
+            "x-origin": "https://music.youtube.com",
+            "Cookie": "; ".join(cookies),
+        }
+        with open(output_path, "w", encoding="utf-8") as out:
+            json.dump(headers, out)
+        return True
+    except Exception as e:
+        logger.error("Error generando browser.json desde cookies.txt: %s", e)
+        return False
+
+
 @app.on_event("startup")
 def load_cookies_from_env():
+    global ytmusic, YTMUSIC_AUTHENTICATED
     cookies_b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
     if cookies_b64:
         try:
@@ -35,6 +80,11 @@ def load_cookies_from_env():
             with open(COOKIES_PATH, "wb") as f:
                 f.write(decoded)
             logger.info("Cookies de YouTube cargadas correctamente en %s", COOKIES_PATH)
+
+            if build_ytmusic_browser_auth(COOKIES_PATH, BROWSER_AUTH_PATH):
+                ytmusic = YTMusic(BROWSER_AUTH_PATH)
+                YTMUSIC_AUTHENTICATED = True
+                logger.info("ytmusicapi autenticado correctamente para playlists privadas.")
         except Exception as e:
             logger.error("Error decodificando YOUTUBE_COOKIES_B64: %s", e)
     else:
@@ -100,34 +150,87 @@ def search_song(query: str) -> Optional[dict]:
     }
 
 
-def populate_related_queue(user_id: str, seed_video_id: str):
+def find_user_playlist(name: str) -> Optional[dict]:
+    """Busca una playlist en tu biblioteca por coincidencia exacta o parcial."""
+    playlists = ytmusic.get_library_playlists(limit=100)
+    target = name.strip().lower()
+
+    # Coincidencia exacta primero
+    for pl in playlists:
+        if pl.get("title", "").strip().lower() == target:
+            return pl
+
+    # Coincidencia parcial
+    for pl in playlists:
+        if target in pl.get("title", "").strip().lower():
+            return pl
+
+    return None
+
+
+def get_playlist_tracks(playlist_id: str) -> list:
+    data = ytmusic.get_playlist(playlist_id, limit=100)
+    tracks = []
+    for t in data.get("tracks", []):
+        vid = t.get("videoId")
+        if not vid:
+            continue
+        artists = ", ".join(a["name"] for a in t.get("artists", [])) or "YouTube Music"
+        thumbs = t.get("thumbnails") or t.get("thumbnail") or []
+        art_url = thumbs[-1]["url"] if thumbs else None
+        tracks.append(
+            {
+                "videoId": vid,
+                "setVideoId": t.get("setVideoId"),
+                "title": t.get("title", "Canción"),
+                "artist": artists,
+                "art_url": art_url,
+            }
+        )
+    return tracks
+
+
+def populate_related_queue(user_id: str, seed_video_id: str, fallback_artist: str = ""):
+    state = PLAYER_STATE.get(user_id)
+    if not state:
+        return
+
+    raw_tracks = []
     try:
-        watch = ytmusic.get_watch_playlist(videoId=seed_video_id, limit=15)
-        tracks = watch.get("tracks", [])
-        state = PLAYER_STATE.get(user_id)
-        if not state:
+        watch = ytmusic.get_watch_playlist(videoId=seed_video_id, radio=True, limit=20)
+        raw_tracks = watch.get("tracks", [])
+    except Exception as e:
+        logger.warning("get_watch_playlist falló (%s). Usando búsqueda de respaldo...", e)
+
+    if not raw_tracks and fallback_artist:
+        try:
+            raw_tracks = ytmusic.search(fallback_artist, filter="songs", limit=20)
+        except Exception as e:
+            logger.error("Error en respaldo de cola: %s", e)
             return
 
-        existing_ids = {t["videoId"] for t in state["queue"]}
-        for t in tracks:
-            vid = t.get("videoId")
-            if not vid or vid in existing_ids:
-                continue
-            artists = ", ".join(a["name"] for a in t.get("artists", [])) or "YouTube Music"
-            thumbs = t.get("thumbnail", [])
-            art_url = thumbs[-1]["url"] if thumbs else None
-            state["queue"].append(
-                {
-                    "videoId": vid,
-                    "title": t.get("title", "Canción"),
-                    "artist": artists,
-                    "art_url": art_url,
-                }
-            )
-            existing_ids.add(vid)
-        logger.info("Cola actualizada para %s: %d canciones", user_id, len(state["queue"]))
-    except Exception as e:
-        logger.error("Error cargando cola relacionada: %s", e)
+    existing_ids = {t["videoId"] for t in state["queue"]}
+    new_tracks = []
+    for t in raw_tracks:
+        vid = t.get("videoId")
+        if not vid or vid in existing_ids:
+            continue
+        artists = ", ".join(a["name"] for a in t.get("artists", [])) or fallback_artist or "YouTube Music"
+        thumbs = t.get("thumbnail") or t.get("thumbnails") or []
+        art_url = thumbs[-1]["url"] if thumbs else None
+        new_tracks.append(
+            {
+                "videoId": vid,
+                "title": t.get("title", "Canción"),
+                "artist": artists,
+                "art_url": art_url,
+            }
+        )
+        existing_ids.add(vid)
+
+    random.shuffle(new_tracks)
+    state["queue"].extend(new_tracks)
+    logger.info("Cola actualizada para %s: %d canciones", user_id, len(state["queue"]))
 
 
 def build_speech_response(text: str, end_session: bool = False) -> dict:
@@ -193,7 +296,11 @@ def build_stop_response(speech: Optional[str] = None) -> dict:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "cookies_loaded": os.path.exists(COOKIES_PATH)}
+    return {
+        "status": "ok",
+        "cookies_loaded": os.path.exists(COOKIES_PATH),
+        "playlists_auth": YTMUSIC_AUTHENTICATED,
+    }
 
 
 @app.get("/stream/{video_id}")
@@ -252,7 +359,7 @@ async def alexa_webhook(request: Request, background_tasks: BackgroundTasks):
 
     if req_type == "LaunchRequest":
         return build_speech_response(
-            "YouTube Music listo. ¿Qué canción o artista quieres escuchar?",
+            "YouTube Music listo. ¿Qué canción o playlist quieres escuchar?",
             end_session=False,
         )
 
@@ -261,6 +368,7 @@ async def alexa_webhook(request: Request, background_tasks: BackgroundTasks):
         intent_name = intent.get("name", "")
         slots = intent.get("slots", {})
 
+        # 1. Reproducir canción
         if intent_name == "PlaySongIntent":
             query = slots.get("query", {}).get("value")
             if not query:
@@ -271,8 +379,7 @@ async def alexa_webhook(request: Request, background_tasks: BackgroundTasks):
                 return build_speech_response(f"No encontré resultados para {query}.", end_session=True)
 
             PLAYER_STATE[user_id] = {"queue": [track], "index": 0, "offset": 0}
-            background_tasks.add_task(extract_audio_info, track["videoId"])
-            background_tasks.add_task(populate_related_queue, user_id, track["videoId"])
+            background_tasks.add_task(populate_related_queue, user_id, track["videoId"], track["artist"])
 
             proxy_url = f"{base_url}/stream/{track['videoId']}"
             return build_play_response(
@@ -281,6 +388,138 @@ async def alexa_webhook(request: Request, background_tasks: BackgroundTasks):
                 speech=f"Reproduciendo {track['title']} de {track['artist']}",
             )
 
+        # 2. Reproducir playlist privada
+        if intent_name == "PlayPlaylistIntent":
+            if not YTMUSIC_AUTHENTICATED:
+                return build_speech_response("Las cookies no tienen sesión activa para leer tus playlists.", end_session=True)
+
+            pl_name = slots.get("playlist", {}).get("value")
+            if not pl_name:
+                return build_speech_response("¿Qué playlist quieres escuchar?")
+
+            pl = await asyncio.to_thread(find_user_playlist, pl_name)
+            if not pl:
+                return build_speech_response(f"No encontré ninguna playlist llamada {pl_name}.", end_session=True)
+
+            tracks = await asyncio.to_thread(get_playlist_tracks, pl["playlistId"])
+            if not tracks:
+                return build_speech_response(f"La playlist {pl['title']} está vacía.", end_session=True)
+
+            random.shuffle(tracks)
+            PLAYER_STATE[user_id] = {"queue": tracks, "index": 0, "offset": 0}
+            first = tracks[0]
+            proxy_url = f"{base_url}/stream/{first['videoId']}"
+            return build_play_response(
+                track=first,
+                stream_url=proxy_url,
+                speech=f"Reproduciendo tu playlist {pl['title']} en aleatorio. Empezando con {first['title']}",
+            )
+
+        # 3. Crear playlist
+        if intent_name == "CreatePlaylistIntent":
+            if not YTMUSIC_AUTHENTICATED:
+                return build_speech_response("No tengo sesión activa para crear playlists.", end_session=True)
+
+            pl_name = slots.get("playlist", {}).get("value")
+            if not pl_name:
+                return build_speech_response("¿Cómo quieres llamar a la nueva playlist?")
+
+            try:
+                await asyncio.to_thread(ytmusic.create_playlist, pl_name, "Creada desde Alexa")
+                return build_speech_response(f"Listo, creé la playlist {pl_name}.", end_session=True)
+            except Exception as e:
+                logger.error("Error creando playlist: %s", e)
+                return build_speech_response(f"No pude crear la playlist {pl_name}.", end_session=True)
+
+        # 4. Borrar playlist
+        if intent_name == "DeletePlaylistIntent":
+            if not YTMUSIC_AUTHENTICATED:
+                return build_speech_response("No tengo sesión activa para borrar playlists.", end_session=True)
+
+            pl_name = slots.get("playlist", {}).get("value")
+            if not pl_name:
+                return build_speech_response("¿Qué playlist quieres borrar?")
+
+            pl = await asyncio.to_thread(find_user_playlist, pl_name)
+            if not pl:
+                return build_speech_response(f"No encontré la playlist {pl_name}.", end_session=True)
+
+            try:
+                await asyncio.to_thread(ytmusic.delete_playlist, pl["playlistId"])
+                return build_speech_response(f"Listo, borré la playlist {pl['title']}.", end_session=True)
+            except Exception as e:
+                logger.error("Error borrando playlist: %s", e)
+                return build_speech_response(f"No pude borrar la playlist {pl['title']}.", end_session=True)
+
+        # 5. Añadir la canción actual a una playlist
+        if intent_name == "AddToPlaylistIntent":
+            if not YTMUSIC_AUTHENTICATED:
+                return build_speech_response("No tengo sesión activa para modificar playlists.", end_session=True)
+
+            state = PLAYER_STATE.get(user_id)
+            if not state or not state["queue"]:
+                return build_speech_response("No hay ninguna canción sonando para agregar.", end_session=True)
+
+            pl_name = slots.get("playlist", {}).get("value")
+            if not pl_name:
+                return build_speech_response("¿A qué playlist quieres agregar esta canción?")
+
+            pl = await asyncio.to_thread(find_user_playlist, pl_name)
+            if not pl:
+                return build_speech_response(f"No encontré la playlist {pl_name}.", end_session=True)
+
+            current_track = state["queue"][state["index"]]
+            try:
+                await asyncio.to_thread(ytmusic.add_playlist_items, pl["playlistId"], [current_track["videoId"]])
+                return build_speech_response(
+                    f"Agregué {current_track['title']} a {pl['title']}.",
+                    end_session=True,
+                )
+            except Exception as e:
+                logger.error("Error agregando canción a playlist: %s", e)
+                return build_speech_response("Hubo un error al agregar la canción a la playlist.", end_session=True)
+
+        # 6. Quitar la canción actual de una playlist
+        if intent_name == "RemoveFromPlaylistIntent":
+            if not YTMUSIC_AUTHENTICATED:
+                return build_speech_response("No tengo sesión activa para modificar playlists.", end_session=True)
+
+            state = PLAYER_STATE.get(user_id)
+            if not state or not state["queue"]:
+                return build_speech_response("No hay ninguna canción sonando para quitar.", end_session=True)
+
+            pl_name = slots.get("playlist", {}).get("value")
+            if not pl_name:
+                return build_speech_response("¿De qué playlist quieres quitar esta canción?")
+
+            pl = await asyncio.to_thread(find_user_playlist, pl_name)
+            if not pl:
+                return build_speech_response(f"No encontré la playlist {pl_name}.", end_session=True)
+
+            current_track = state["queue"][state["index"]]
+            try:
+                tracks = await asyncio.to_thread(get_playlist_tracks, pl["playlistId"])
+                match = next((t for t in tracks if t["videoId"] == current_track["videoId"] and t.get("setVideoId")), None)
+                if not match:
+                    return build_speech_response(
+                        f"{current_track['title']} no está en la playlist {pl['title']}.",
+                        end_session=True,
+                    )
+
+                await asyncio.to_thread(
+                    ytmusic.remove_playlist_items,
+                    pl["playlistId"],
+                    [{"videoId": match["videoId"], "setVideoId": match["setVideoId"]}],
+                )
+                return build_speech_response(
+                    f"Quité {current_track['title']} de {pl['title']}.",
+                    end_session=True,
+                )
+            except Exception as e:
+                logger.error("Error quitando canción de playlist: %s", e)
+                return build_speech_response("Hubo un error al quitar la canción de la playlist.", end_session=True)
+
+        # Controles de reproducción
         if intent_name in ("AMAZON.PauseIntent", "AMAZON.StopIntent", "AMAZON.CancelIntent"):
             return build_stop_response()
 
@@ -325,10 +564,11 @@ async def alexa_webhook(request: Request, background_tasks: BackgroundTasks):
 
         if intent_name == "AMAZON.HelpIntent":
             return build_speech_response(
-                "Puedes pedirme cualquier canción diciendo: pon, seguido del nombre o artista.",
+                "Puedes pedirme una canción, reproducir una playlist, o crear, borrar y modificar tus playlists.",
                 end_session=False,
             )
 
+    # Eventos de AudioPlayer
     if req_type == "AudioPlayer.PlaybackNearlyFinished":
         state = PLAYER_STATE.get(user_id)
         current_token = req.get("token")
