@@ -39,7 +39,7 @@ def load_cookies_from_env():
 
 def extract_audio_url(video_id: str) -> Optional[str]:
     """Extrae la URL directa del stream de audio (M4A/AAC) compatible con Alexa."""
-    url = f"https://music.youtube.com/watch?v={video_id}"
+    url = f"https://www.youtube.com/watch?v={video_id}"
     ydl_opts = {
         "format": "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio",
         "quiet": True,
